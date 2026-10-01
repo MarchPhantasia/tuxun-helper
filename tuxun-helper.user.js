@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图寻辅助（题目匹配修复版）
 // @namespace    local.tuxun.round-fixed
-// @version      1.5.0
+// @version      1.6.0
 // @description  题目面板、中外文对照及华为底图辅助标点；支持挑战与排位模式
 // @match        *://tuxun.fun/*
 // @run-at       document-start
@@ -16,24 +16,71 @@
 (function () {
     'use strict';
     const nativeFetch = window.fetch.bind(window);
+    // Storage, UI, and observation failures must never escape into site callbacks.
+    const memory = new Map();
+    const storage = {
+        getItem(key) { if (memory.has(key)) return memory.get(key); try { return localStorage.getItem(key); } catch { return null; } },
+        setItem(key, value) { memory.set(key, String(value)); try { localStorage.setItem(key, value); } catch {} },
+        removeItem(key) { memory.set(key, null); try { localStorage.removeItem(key); } catch {} }
+    };
+    let enabled = false, epoch = 0;
+    let onDemand = storage.getItem('_tx_on_demand') !== '0';
+    let launcher = null, fallbackTimer, syncTimer, mapRetry, mapObserver, translationAbort, translationTimer;
+    const timers = new Set(), cleanups = new Set(), pendingXHR = new Set();
+    function guard(fn) {
+        try {
+            const result = fn();
+            if (result && typeof result.then === 'function') result.catch(e => report('warn', '[图寻辅助] 功能暂不可用', e));
+            return result;
+        } catch (e) { report('warn', '[图寻辅助] 功能暂不可用', e); }
+    }
+    function later(fn, delay) {
+        const generation = epoch;
+        const id = setTimeout(() => {
+            timers.delete(id);
+            if (enabled && epoch === generation) guard(fn);
+        }, delay);
+        timers.add(id);
+        return id;
+    }
+    function cancel(id) { clearTimeout(id); timers.delete(id); }
+    function cancelTimers() {
+        for (const id of timers) clearTimeout(id);
+        timers.clear();
+        fallbackTimer = syncTimer = mapRetry = undefined;
+        syncAgain = false; nextSyncAt = 0;
+    }
+    function listen(object, event, fn, options, bucket = cleanups) {
+        const callback = (...args) => guard(() => fn(...args));
+        object.addEventListener(event, callback, options);
+        const remove = () => { object.removeEventListener(event, callback, options); bucket.delete(remove); };
+        bucket.add(remove);
+        return remove;
+    }
+    function drain(bucket) { for (const cleanup of [...bucket]) guard(cleanup); bucket.clear(); }
+
     const GAME = new Set(['/api/v0/tuxun/challenge/getGameInfo', '/api/v0/tuxun/solo/get']);
     const META = /\/mapProxy\/(getQQPanoInfo|getPanoInfo)$/;
     const cache = new Map();
-    const requests = new WeakMap();
+    let requests = new WeakMap();
     let sequence = 0, latestGameRequest = 0, target = null, location = null;
     let revision = 0, job = 0, timer, controller;
     let page = window.location.href;
     let gameInfoUrl = null, syncing = false;
     let syncController = null, pendingLookup = false;
-    let quietMode = localStorage.getItem('_tx_quiet') !== '0';
+    let syncAgain = false, nextSyncAt = 0, recoveryController = null;
+    let quietMode = storage.getItem('_tx_quiet') !== '0';
     function report(level, ...args) {
-        if (!quietMode) console[level](...args);
-        if (level === 'warn') show({ status: '数据读取异常，可刷新重试或关闭静默模式查看日志' });
+        try { if (!quietMode) console[level](...args); } catch {}
+        // Reporting is itself isolated: a broken panel cannot break a request.
+        if (level === 'warn') {
+            try { view.status = '辅助功能暂不可用，可刷新重试'; renderPanel(); } catch {}
+        }
     }
     const translations = new Map();
     let mapMark = null;
     let pendingMapFocus = null;
-    let mapEnabled = localStorage.getItem('_tx_map_marker') === '1';
+    let mapEnabled = storage.getItem('_tx_map_marker') === '1';
     let mapMessage = '开启后在右下角地图显示辅助标点';
     let panel = null;
     function mapStatus(message) {
@@ -44,12 +91,12 @@
     function clearMapMarker() {
         if (!mapMark) return;
         const { map, layer, draw, container, positioned } = mapMark;
+        mapMark = null;
         for (const event of ['render', 'move', 'resize']) {
             try { map.off(event, draw); } catch {}
         }
-        layer.remove();
-        if (positioned && container.style.position === 'relative') container.style.position = '';
-        mapMark = null;
+        try { layer.remove(); } catch {}
+        try { if (positioned && container.style.position === 'relative') container.style.position = ''; } catch {}
     }
     function findMap() {
         // The captured React Map component uses id="map" and a petal raster
@@ -84,8 +131,7 @@
         return null;
     }
     function refreshMapMarker() {
-        if (document.hidden) return;
-        if (!mapEnabled) return;
+        if (!enabled || document.hidden || !mapEnabled) return;
         if (!target || !location) { clearMapMarker(); mapStatus('等待当前题目坐标'); return; }
         if (mapMark && (!mapMark.container.isConnected || mapMark.layer.isConnected === false ||
             mapMark.canvas.isConnected === false || mapMark.map.getCanvas() !== mapMark.canvas)) clearMapMarker();
@@ -136,11 +182,11 @@
         if (!target || !location) { mapStatus('等待当前题目坐标'); return; }
         if (!mapEnabled) {
             mapEnabled = true;
-            localStorage.setItem('_tx_map_marker', '1');
+            storage.setItem('_tx_map_marker', '1');
             renderPanel();
         }
         pendingMapFocus = { revision, lat: location.lat, lng: location.lng };
-        refreshMapMarker();
+        startMapWatch();
     }
     function applyPendingMapFocus() {
         if (!pendingMapFocus || !mapMark) return;
@@ -156,11 +202,11 @@
         } catch { mapStatus('无法移动地图视野，请手动缩放查看标点'); }
     }
     let view = { status: '等待题目数据', round: null, id: '', coords: '', address: '', detail: '', addressZh: '', detailZh: '', translation: '' };
-    const autoTranslate = () => localStorage.getItem('_tx_translate') !== '0';
-    function show(patch) { Object.assign(view, patch); renderPanel(); }
+    const autoTranslate = () => storage.getItem('_tx_translate') !== '0';
+    function show(patch) { Object.assign(view, patch); guard(renderPanel); }
     function clearView(status = '等待当前题目数据') {
         view = { status, round: null, id: '', coords: '', address: '', detail: '', addressZh: '', detailZh: '', translation: '' };
-        renderPanel();
+        guard(renderPanel);
     }
     function renderPanel() {
         if (!panel) return;
@@ -180,10 +226,11 @@
         panel.root.getElementById('map-mark').checked = mapEnabled;
         panel.root.getElementById('map-focus').disabled = !location;
         panel.root.getElementById('quiet').checked = quietMode;
+        panel.root.getElementById('on-demand').checked = onDemand;
         put('map-status', mapMessage);
     }
-    function mountPanel() {
-        if (panel || !document.documentElement) return;
+    function mountPanel(expanded = false) {
+        if (!enabled || panel || !document.documentElement) return;
         const host = document.createElement('div');
         host.id = 'tuxun-helper-panel';
         host.style.cssText = 'position:fixed;top:96px;right:20px;z-index:2147483647;display:block;max-width:calc(100vw - 20px);color-scheme:dark;';
@@ -213,7 +260,7 @@
             .folded{width:235px}.folded .body{display:none}
           </style>
           <section class="panel" aria-label="图寻辅助面板">
-            <header id="drag"><span class="mark" aria-hidden="true">⌖</span><div class="heading"><div class="title">图寻辅助</div><div class="round" id="round">等待题目</div></div><button class="collapse" id="collapse" aria-label="折叠面板" aria-expanded="true">−</button></header>
+            <header id="drag"><span class="mark" aria-hidden="true">⌖</span><div class="heading"><div class="title">图寻辅助</div><div class="round" id="round">等待题目</div></div><button class="collapse" id="collapse" aria-label="折叠面板" aria-expanded="true">−</button><button class="collapse" id="hide-panel" aria-label="隐藏面板" title="隐藏面板（Alt+Shift+T）">×</button></header>
             <div class="body">
               <div class="status" role="status"><span class="dot"></span><span id="status"></span></div>
               <div class="card"><div class="label">中文 · 地址</div><div class="chinese" id="chinese"></div><div class="divider"></div><div class="label">原文 · 地址服务返回</div><div class="original" id="original"></div></div>
@@ -223,12 +270,14 @@
               <div class="toolbar" style="margin-top:12px"><label class="toggle"><input type="checkbox" id="map-mark">地图辅助标点</label><button id="map-focus">定位标记</button></div>
               <div class="translation-note" id="map-status" role="status"></div>
               <label class="toggle" title="收起面板、关闭本脚本的控制台输出；页面隐藏时暂停额外查询。不会隐藏脚本或规避网站检测。"><input type="checkbox" id="quiet">静默模式</label>
+              <div class="toolbar" style="margin-top:12px"><label class="toggle"><input type="checkbox" id="on-demand">按需显示面板</label><button id="pause">暂停辅助</button></div>
               <details><summary>坐标与街景 ID</summary><dl><dt>纬度，经度</dt><dd id="coords"></dd><dt>Pano ID</dt><dd id="pano"></dd></dl></details>
               <div class="foot"><span>题目起点 · 拖动标题栏移动</span><button class="link" id="settings">地图源设置</button></div>
             </div>
           </section>`;
         document.documentElement.appendChild(host);
-        panel = { host, root };
+        panel = { host, root, cleanups: new Set(), copyTimer: undefined };
+        const ui = (element, event, fn, options) => listen(element, event, fn, options, panel.cleanups);
         const section = root.querySelector('section');
         const collapse = root.getElementById('collapse');
         const fold = value => {
@@ -236,9 +285,9 @@
             collapse.textContent = value ? '+' : '−';
             collapse.setAttribute('aria-expanded', String(!value));
             collapse.setAttribute('aria-label', value ? '展开面板' : '折叠面板');
-            localStorage.setItem('_tx_panel_fold', value ? '1' : '0');
+            storage.setItem('_tx_panel_fold', value ? '1' : '0');
         };
-        fold(quietMode || localStorage.getItem('_tx_panel_fold') === '1');
+        fold(!expanded && (quietMode || storage.getItem('_tx_panel_fold') === '1'));
         const place = (x, y) => {
             const rect = host.getBoundingClientRect();
             const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
@@ -247,65 +296,132 @@
             root.querySelector('.body').style.maxHeight = Math.max(100, window.innerHeight - top - 78) + 'px';
             return { left, top };
         };
-        try { const p = JSON.parse(localStorage.getItem('_tx_panel_pos')); if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) place(p.left, p.top); } catch {}
-        collapse.addEventListener('click', () => { fold(!section.classList.contains('folded')); const r = host.getBoundingClientRect(); place(r.left, r.top); });
+        try { const p = JSON.parse(storage.getItem('_tx_panel_pos')); if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) place(p.left, p.top); } catch {}
+        ui(collapse, 'click', () => { fold(!section.classList.contains('folded')); const r = host.getBoundingClientRect(); place(r.left, r.top); });
         const header = root.getElementById('drag');
         let drag = null;
-        header.addEventListener('pointerdown', e => {
+        ui(header, 'pointerdown', e => {
             if (e.button !== 0 || e.target.closest('button')) return;
             const r = host.getBoundingClientRect();
             drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
             header.setPointerCapture(e.pointerId); e.preventDefault();
         });
-        header.addEventListener('pointermove', e => { if (drag) place(e.clientX - drag.dx, e.clientY - drag.dy); });
+        ui(header, 'pointermove', e => { if (drag) place(e.clientX - drag.dx, e.clientY - drag.dy); });
         const endDrag = () => {
             if (!drag) return;
             drag = null;
             const r = host.getBoundingClientRect();
-            localStorage.setItem('_tx_panel_pos', JSON.stringify({ left: r.left, top: r.top }));
+            storage.setItem('_tx_panel_pos', JSON.stringify({ left: r.left, top: r.top }));
         };
-        header.addEventListener('pointerup', endDrag); header.addEventListener('pointercancel', endDrag);
-        window.addEventListener('resize', () => { const r = host.getBoundingClientRect(); place(r.left, r.top); });
-        for (const event of ['pointerdown', 'pointerup', 'click', 'dblclick', 'wheel', 'keydown', 'keyup']) host.addEventListener(event, e => e.stopPropagation());
-        root.getElementById('refresh').addEventListener('click', async () => { await syncRound(); clearTimeout(timer); update(); });
-        root.getElementById('settings').addEventListener('click', resetSource);
-        root.getElementById('quiet').addEventListener('change', e => {
+        ui(header, 'pointerup', endDrag); ui(header, 'pointercancel', endDrag);
+        ui(window, 'resize', () => { const r = host.getBoundingClientRect(); place(r.left, r.top); });
+        for (const event of ['pointerdown', 'pointerup', 'click', 'dblclick', 'wheel', 'keydown', 'keyup']) ui(host, event, e => e.stopPropagation());
+        ui(root.getElementById('refresh'), 'click', async () => {
+            await syncRound();
+            if (!enabled) return;
+            if (!location) await recoverLocation();
+            cancel(timer); guard(update);
+        });
+        ui(root.getElementById('settings'), 'click', resetSource);
+        ui(root.getElementById('quiet'), 'change', e => {
             quietMode = e.target.checked;
-            localStorage.setItem('_tx_quiet', quietMode ? '1' : '0');
+            storage.setItem('_tx_quiet', quietMode ? '1' : '0');
             if (quietMode) fold(true);
         });
-        root.getElementById('map-mark').addEventListener('change', e => {
+        ui(root.getElementById('map-mark'), 'change', e => {
             mapEnabled = e.target.checked;
-            localStorage.setItem('_tx_map_marker', mapEnabled ? '1' : '0');
-            if (mapEnabled) refreshMapMarker();
-            else { pendingMapFocus = null; clearMapMarker(); mapStatus('地图辅助标点已关闭'); }
+            storage.setItem('_tx_map_marker', mapEnabled ? '1' : '0');
+            if (mapEnabled) guard(startMapWatch);
+            else { pendingMapFocus = null; stopMapWatch(); clearMapMarker(); mapStatus('地图辅助标点已关闭'); }
         });
-        root.getElementById('map-focus').addEventListener('click', focusMarker);
-        root.getElementById('translate').addEventListener('change', e => {
-            localStorage.setItem('_tx_translate', e.target.checked ? '1' : '0');
-            clearTimeout(timer); update();
+        ui(root.getElementById('map-focus'), 'click', focusMarker);
+        ui(root.getElementById('translate'), 'change', e => setTranslation(e.target.checked));
+        ui(root.getElementById('hide-panel'), 'click', unmountPanel);
+        ui(root.getElementById('on-demand'), 'change', e => {
+            onDemand = e.target.checked;
+            storage.setItem('_tx_on_demand', onDemand ? '1' : '0');
+            if (onDemand) unmountPanel();
         });
-        root.getElementById('copy').addEventListener('click', async () => {
+        ui(root.getElementById('pause'), 'click', pause);
+        ui(root.getElementById('copy'), 'click', async () => {
             const text = [`第 ${view.round} 题起点`, `中文：${view.addressZh || '暂无译文'}`, `原文：${view.address}`, view.detail && `街景：${view.detailZh || view.detail}`, `坐标：${view.coords}`, `pano：${view.id}`].filter(Boolean).join('\n');
+            const owner = panel;
             const button = root.getElementById('copy');
             try { await navigator.clipboard.writeText(text); button.textContent = '已复制'; }
             catch { button.textContent = '复制失败'; }
-            setTimeout(() => { button.textContent = '复制'; }, 1500);
+            if (panel !== owner) return;
+            cancel(owner.copyTimer);
+            owner.copyTimer = later(() => { button.textContent = '复制'; }, 1500);
         });
         renderPanel();
     }
 
+    function unmountPanel() {
+        if (!panel) return;
+        const owner = panel;
+        panel = null;
+        cancel(owner.copyTimer);
+        drain(owner.cleanups);
+        owner.host.remove();
+        updateLauncher();
+    }
+    function updateLauncher() {
+        if (!launcher) return;
+        launcher.hidden = enabled && !!panel;
+        launcher.textContent = enabled ? '图寻' : '恢复辅助';
+        launcher.title = enabled ? '显示辅助面板（Alt+Shift+T）' : '辅助已暂停，点击恢复';
+    }
+    function togglePanel() {
+        if (!enabled) { resume(); guard(() => mountPanel(true)); }
+        else if (panel) unmountPanel();
+        else guard(() => mountPanel(true));
+        updateLauncher();
+    }
+    function startMapWatch() {
+        if (!enabled || document.hidden || !mapEnabled) return;
+        guard(refreshMapMarker);
+        if (!mapObserver && typeof MutationObserver !== 'undefined' && document.documentElement) {
+            mapObserver = new MutationObserver(records => guard(() => {
+                if (!enabled || document.hidden || !mapEnabled) return;
+                // Only map DOM changes matter; panel text updates never rescan React.
+                if (records.some(r => r.target.closest?.('#map') ||
+                    [...r.addedNodes, ...r.removedNodes].some(n => n.nodeType === 1 &&
+                        (n.id === 'map' || n.querySelector?.('#map, canvas.maplibregl-canvas, canvas.mapboxgl-canvas'))))) {
+                    cancel(mapRetry);
+                    mapRetry = later(startMapWatch, 100);
+                }
+            }));
+            mapObserver.observe(document.documentElement, { childList: true, subtree: true });
+        }
+        // A bounded retry covers React assigning its map ref after DOM insertion.
+        cancel(mapRetry);
+        let attempts = 0;
+        const retry = () => {
+            if (!mapEnabled || document.hidden) return;
+            guard(refreshMapMarker);
+            if (!mapMark && ++attempts < 5) mapRetry = later(retry, 1000);
+        };
+        if (target && location && !mapMark) mapRetry = later(retry, 1000);
+    }
+    function stopMapWatch() {
+        cancel(mapRetry); mapRetry = undefined;
+        try { mapObserver?.disconnect(); } catch {}
+        mapObserver = null;
+    }
     function invalidate() {
         pendingLookup = false;
         pendingMapFocus = null;
         revision++;
         job++;
-        clearTimeout(timer);
+        cancel(timer);
         controller?.abort();
+        translationAbort?.abort(); translationAbort = null;
+        cancel(translationTimer);
+        recoveryController?.abort(); recoveryController = null;
         controller = null;
         location = null;
         clearMapMarker();
-        if (mapEnabled) mapStatus('等待当前题目坐标');
+        if (mapEnabled) guard(() => mapStatus('等待当前题目坐标'));
         clearView();
     }
     function checkPage() {
@@ -315,7 +431,10 @@
             target = null;
             cache.clear();
             gameInfoUrl = null;
-            syncController?.abort();
+            cancel(fallbackTimer); cancel(syncTimer); syncTimer = undefined;
+            syncAgain = false; nextSyncAt = 0;
+            stopMapWatch();
+            syncController?.abort(); syncController = null; syncing = false;
             latestGameRequest = ++sequence;
         }
     }
@@ -329,48 +448,62 @@
         return null;
     }
     function begin(url) {
+        if (!enabled) return null;
         checkPage();
         const type = kind(url);
         if (!type) return null;
-        const request = { type, page, seq: ++sequence };
+        const request = { type, page, epoch, seq: ++sequence };
         if (type === 'game') {
             gameInfoUrl = new URL(url, window.location.href).href;
             latestGameRequest = request.seq;
-            // Suspend old output as soon as a round refresh starts.
-            invalidate();
-            target = null;
+            cancel(syncTimer); syncTimer = undefined;
+            armFallback();
         }
         return request;
     }
     function panoKey(p, id) { return p + ':' + id; }
-    // Some next-round transitions do not call getGameInfo. Recheck the known
-    // read-only endpoint; never infer a new round from an unrelated pano.
+    // Site game responses are authoritative. Unseen panoramas only trigger a
+    // debounced confirmation; they are never treated as answers themselves.
+    function armFallback() {
+        cancel(fallbackTimer);
+        if (enabled && gameInfoUrl && !document.hidden) fallbackTimer = later(async () => {
+            await syncRound(); armFallback();
+        }, 30000);
+    }
+    function requestSync() {
+        if (!enabled || !gameInfoUrl || document.hidden || syncTimer !== undefined) return;
+        syncTimer = later(() => {
+            syncTimer = undefined;
+            if (syncing) { syncAgain = true; return; }
+            nextSyncAt = Date.now() + 1500;
+            return syncRound();
+        }, Math.max(350, nextSyncAt - Date.now()));
+    }
     async function syncRound() {
+        if (!enabled) return;
         checkPage();
         if (!gameInfoUrl || syncing || document.hidden) return;
-        const url = gameInfoUrl, activePage = page, stamp = latestGameRequest;
+        const url = gameInfoUrl, activePage = page, stamp = latestGameRequest, generation = epoch;
         syncing = true;
         const abort = new AbortController();
         syncController = abort;
-        const timeout = setTimeout(() => abort.abort(), 8000);
+        const timeout = later(() => abort.abort(), 8000);
         try {
             const response = await nativeFetch(url, { signal: abort.signal, credentials: 'same-origin', cache: 'no-store' });
             if (!response.ok) return;
             const data = await response.json();
             checkPage();
-            if (abort.signal.aborted || document.hidden || activePage !== page || url !== gameInfoUrl || stamp !== latestGameRequest) return;
-            const game = data?.success === true ? data.data : null;
-            if (!game) return;
-            const round = game.rounds?.find(r => r.round === game.currentRound);
-            if (target && target.game === game.id && target.round === game.currentRound &&
-                target.id === String(round?.panoId) && target.source === round?.source) return;
-            consume(begin(url), data);
+            if (!enabled || epoch !== generation || abort.signal.aborted || document.hidden ||
+                activePage !== page || url !== gameInfoUrl || stamp !== latestGameRequest) return;
+            consume({ type: 'game', page, epoch, seq: stamp }, data);
         } catch (e) {
             if (e.name !== 'AbortError') report('info', '[图寻辅助] 题目同步失败，将重试。');
         } finally {
-            clearTimeout(timeout);
-            syncing = false;
-            if (syncController === abort) syncController = null;
+            cancel(timeout);
+            if (syncController === abort) {
+                syncController = null; syncing = false;
+                if (syncAgain) { syncAgain = false; requestSync(); }
+            }
         }
     }
     function useCachedLocation() {
@@ -381,23 +514,53 @@
         invalidate();
         location = { ...item };
         show({ status: '正在查询地址', round: target.round, id: target.id, coords: `${item.lat}, ${item.lng}` });
-        refreshMapMarker();
-        timer = setTimeout(update, 500);
+        guard(startMapWatch);
+        timer = later(update, 500);
+    }
+    // After a pause, the site may already have loaded the current panorama.
+    // Reuse cached data when possible; recover QQ metadata only for the round
+    // just confirmed by the authoritative endpoint (the captured API contract).
+    async function recoverLocation() {
+        if (!enabled || document.hidden || !target || location || recoveryController || target.p !== 't') return;
+        const snapshot = target, generation = epoch;
+        const abort = new AbortController();
+        recoveryController = abort;
+        const timeout = later(() => abort.abort(), 8000);
+        try {
+            const url = new URL('/api/v0/tuxun/mapProxy/getQQPanoInfo', page);
+            url.searchParams.set('pano', snapshot.id);
+            const request = { type: 't', page, epoch, seq: ++sequence };
+            const data = await json(url.href, abort.signal);
+            if (enabled && epoch === generation && !abort.signal.aborted && target === snapshot) consume(request, data);
+        } catch (error) {
+            if (error.name !== 'AbortError') report('info', '[图寻辅助] 等待网站重新加载当前街景');
+        } finally {
+            cancel(timeout);
+            if (recoveryController === abort) recoveryController = null;
+        }
     }
     function consume(request, data) {
         checkPage();
-        if (!request || request.page !== page) return;
+        if (!enabled || !request || request.epoch !== epoch || request.page !== page) return;
         if (request.type === 'game') {
             if (request.seq !== latestGameRequest) return;
             const game = data?.success === true ? data.data : null;
+            if (!game || !Array.isArray(game.rounds)) return;
             const round = game?.rounds?.find(r => r.round === game.currentRound);
-            if (!round?.panoId) return;
+            if (!round?.panoId) { invalidate(); target = null; return; }
             const p = { qq_pano: 't', baidu_pano: 'b', google: 'g', google_pano: 'g' }[round.source];
             if (!p) {
+                invalidate(); target = null;
                 show({ status: `暂未适配街景来源：${round.source}` });
                 report('info', '[图寻辅助] 当前街景来源尚未验证，暂停查询：', round.source);
                 return;
             }
+            if (target && target.game === game.id && target.round === game.currentRound &&
+                target.id === String(round.panoId) && target.source === round.source) {
+                useCachedLocation();
+                return;
+            }
+            invalidate();
             target = { id: String(round.panoId), p, source: round.source, round: game.currentRound, game: game.id };
             show({ status: '等待匹配的街景数据', round: target.round, id: target.id });
             useCachedLocation();
@@ -423,45 +586,77 @@
         cache.set(key, { ...item, seq: request.seq });
         if (cache.size > 200) cache.delete(cache.keys().next().value);
         if (target && target.p === item.p && target.id === item.id) useCachedLocation();
+        else requestSync();
     }
 
-    // Install hooks before configuration dialogs or page requests.
-    const originalOpen = XMLHttpRequest.prototype.open;
-    const originalSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-        const result = originalOpen.call(this, method, url, ...rest);
-        requests.set(this, { url: String(url) });
-        return result;
-    };
-    XMLHttpRequest.prototype.send = function (...args) {
-        const info = requests.get(this);
-        let request;
-        try { request = info && begin(info.url); } catch (e) { report('warn', '[图寻辅助] 请求识别失败', e); }
-        if (request) {
-            const onLoad = () => {
-                try {
-                    if (this.status < 200 || this.status >= 300) return;
-                    const d = this.responseType === 'json' ? this.response :
+    function installHooks() {
+        const generation = epoch;
+        const active = () => enabled && epoch === generation;
+        const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSend = XMLHttpRequest.prototype.send;
+        const originalFetch = window.fetch;
+        const open = function (method, url, ...rest) {
+            const result = originalOpen.call(this, method, url, ...rest);
+            if (active()) guard(() => requests.set(this, { url: String(url) }));
+            return result;
+        };
+        const send = function (...args) {
+            let cleanup;
+            if (active()) guard(() => {
+                const info = requests.get(this);
+                const request = info && begin(info.url);
+                if (!request) return;
+                cleanup = () => {
+                    this.removeEventListener('load', onLoad);
+                    this.removeEventListener('loadend', cleanup);
+                    pendingXHR.delete(cleanup);
+                };
+                const onLoad = () => guard(() => {
+                    if (!active() || this.status < 200 || this.status >= 300) return;
+                    const data = this.responseType === 'json' ? this.response :
                         (!this.responseType || this.responseType === 'text') ? JSON.parse(this.responseText) : null;
-                    if (d) consume(request, d);
-                } catch (e) { report('warn', '[图寻辅助] 元数据解析失败', e); }
-            };
-            this.addEventListener('load', onLoad, { once: true });
-            this.addEventListener('loadend', () => this.removeEventListener('load', onLoad), { once: true });
+                    if (data) consume(request, data);
+                });
+                pendingXHR.add(cleanup);
+                this.addEventListener('load', onLoad, { once: true });
+                this.addEventListener('loadend', cleanup, { once: true });
+            });
+            // Original errors and return values belong to the site, unchanged.
+            try { return originalSend.apply(this, args); }
+            catch (error) { if (cleanup) guard(cleanup); throw error; }
+        };
+        const fetch = function (...args) {
+            const promise = originalFetch.apply(this, args);
+            if (active()) guard(() => {
+                const input = args[0];
+                const request = begin(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
+                if (request) promise.then(async response => {
+                    if (!active() || !response.ok) return;
+                    const data = await response.clone().json();
+                    if (active()) consume(request, data);
+                }).catch(e => { if (active()) report('warn', '[图寻辅助] 元数据解析失败', e); });
+            });
+            return promise;
+        };
+        // Restore only our own wrappers; do not undo later changes by the page.
+        function hook(object, key, wrapper, original) {
+            cleanups.add(() => { if (object[key] === wrapper) object[key] = original; });
+            guard(() => { object[key] = wrapper; });
         }
-        return originalSend.apply(this, args);
-    };
-    window.fetch = function (input, init) {
-        let request;
-        try { request = begin(typeof input === 'string' || input instanceof URL ? String(input) : input.url); }
-        catch (e) { report('warn', '[图寻辅助] 请求识别失败', e); }
-        const promise = nativeFetch(input, init);
-        if (request) promise.then(response => {
-            if (response.ok) response.clone().json().then(data => consume(request, data))
-                .catch(e => report('warn', '[图寻辅助] 元数据解析失败', e));
-        }, () => {});
-        return promise;
-    };
+        hook(XMLHttpRequest.prototype, 'open', open, originalOpen);
+        hook(XMLHttpRequest.prototype, 'send', send, originalSend);
+        hook(window, 'fetch', fetch, originalFetch);
+        if (window.history) for (const name of ['pushState', 'replaceState']) {
+            const original = window.history[name];
+            if (typeof original !== 'function') continue;
+            const wrapper = function (...args) {
+                const result = original.apply(this, args);
+                if (active()) guard(checkPage);
+                return result;
+            };
+            hook(window.history, name, wrapper, original);
+        }
+    }
 
     async function json(url, signal) {
         const response = await nativeFetch(url, { signal });
@@ -469,8 +664,8 @@
         return response.json();
     }
     async function address(s, signal) {
-        const key = localStorage.getItem('_tx_k');
-        if (localStorage.getItem('_tx_s') === '1' && key) {
+        const key = storage.getItem('_tx_k');
+        if (storage.getItem('_tx_s') === '1' && key) {
             const d = await json('https://restapi.amap.com/v3/geocode/regeo?' + new URLSearchParams({ output: 'json', location: `${s.lng},${s.lat}`, key, radius: '100' }), signal);
             if (d.status !== '1') throw new Error(d.info || '高德查询失败');
             return d.regeocode?.formatted_address || '未知地址';
@@ -505,6 +700,7 @@
         return s.str;
     }
     async function update() {
+        if (!enabled) return;
         checkPage();
         if (document.hidden) { pendingLookup = !!(target && location); return; }
         if (!target || !location) {
@@ -513,22 +709,23 @@
             return;
         }
         controller?.abort();
+        translationAbort?.abort(); translationAbort = null;
+        cancel(translationTimer);
         pendingLookup = false;
         const abort = new AbortController();
         controller = abort;
         const token = ++job, version = revision, activePage = page;
         const s = { ...location, round: target.round };
         show({ status: '正在查询地址', round: s.round, id: s.id, coords: `${s.lat}, ${s.lng}`, address: '', detail: '', addressZh: '', detailZh: '', translation: '' });
-        const timeout = setTimeout(() => abort.abort(), 12000);
-        let translationTimeout;
+        const timeout = later(() => abort.abort(), 12000);
         const current = () => {
             checkPage();
-            return version === revision && token === job && activePage === page;
+            return enabled && version === revision && token === job && activePage === page;
         };
         try {
             const results = await Promise.allSettled([address(s, abort.signal), description(s, abort.signal)]);
             if (!current()) return;
-            clearTimeout(timeout);
+            cancel(timeout);
             const [a, d] = results;
             const text = a.status === 'fulfilled' ? a.value : `地址查询失败：${a.reason?.message || '网络错误'}`;
             const detail = d.status === 'fulfilled' ? d.value : '';
@@ -537,10 +734,24 @@
                 addressZh: a.status === 'rejected' ? '地址暂不可用，请稍后刷新' : '',
                 translation: autoTranslate() ? '正在自动翻译为简体中文…' : '自动翻译已关闭，原文仍会自动更新。' });
             report('log', `[图寻辅助] 第 ${s.round} 题起点：${text}${detail ? '（' + detail + '）' : ''}\npano: ${s.id}\n坐标: ${s.lat}, ${s.lng}`);
-            if (!autoTranslate()) return;
-            translationTimeout = setTimeout(() => abort.abort(), 8000);
+            if (autoTranslate()) await updateTranslations();
+        } finally {
+            cancel(timeout);
+            if (controller === abort) controller = null;
+        }
+    }
+    async function updateTranslations() {
+        if (!enabled || !autoTranslate()) return;
+        translationAbort?.abort();
+        cancel(translationTimer);
+        const abort = new AbortController();
+        translationAbort = abort;
+        const version = revision, token = job, original = view.address, detail = view.detail;
+        const timeout = later(() => abort.abort(), 8000);
+        translationTimer = timeout;
+        try {
             const translated = await Promise.allSettled([translate(original, abort.signal), translate(detail, abort.signal)]);
-            if (!current()) return;
+            if (!enabled || !autoTranslate() || translationAbort !== abort || version !== revision || token !== job) return;
             const [ta, td] = translated;
             const failed = translated.some(r => r.status === 'rejected');
             show({ addressZh: original ? (ta.status === 'fulfilled' ? ta.value : '翻译暂不可用，请参考下方原文') : '地址暂不可用，请稍后刷新',
@@ -548,64 +759,117 @@
                 translation: failed ? 'Google 翻译连接失败或受限；已保留原文，可点击刷新重试。' :
                     (original || detail ? 'Google 自动翻译 · 地名请结合原文核对' : '暂无可翻译的文本') });
         } finally {
-            clearTimeout(timeout);
-            clearTimeout(translationTimeout);
-            if (controller === abort) controller = null;
+            cancel(timeout);
+            if (translationAbort === abort) translationAbort = null;
         }
     }
+    function setTranslation(value) {
+        storage.setItem('_tx_translate', value ? '1' : '0');
+        if (!value) {
+            translationAbort?.abort(); translationAbort = null;
+            cancel(translationTimer);
+            show({ translation: '自动翻译已关闭，原文仍会自动更新。' });
+        } else if (view.address) guard(updateTranslations);
+    }
     function configure() {
-        if (!localStorage.getItem('_tx_s')) {
-            localStorage.setItem('_tx_s', confirm('选择地址查询服务：\n确定：高德（需要 Web 服务 Key）\n取消：OSM') ? '1' : '0');
+        if (!storage.getItem('_tx_s')) {
+            storage.setItem('_tx_s', confirm('选择地址查询服务：\n确定：高德（需要 Web 服务 Key）\n取消：OSM') ? '1' : '0');
         }
-        if (localStorage.getItem('_tx_s') === '1' && !localStorage.getItem('_tx_k')) {
+        if (storage.getItem('_tx_s') === '1' && !storage.getItem('_tx_k')) {
             const key = prompt('请输入高德 Web 服务 Key（32 位），取消则使用 OSM：', '')?.trim();
-            if (key && /^[a-zA-Z0-9]{32}$/.test(key)) localStorage.setItem('_tx_k', key);
-            else localStorage.setItem('_tx_s', '0');
+            if (key && /^[a-zA-Z0-9]{32}$/.test(key)) storage.setItem('_tx_k', key);
+            else storage.setItem('_tx_s', '0');
         }
     }
     function resetSource() {
         controller?.abort();
+        translationAbort?.abort(); translationAbort = null; cancel(translationTimer);
         job++;
-        localStorage.removeItem('_tx_s');
-        localStorage.removeItem('_tx_k');
+        storage.removeItem('_tx_s');
+        storage.removeItem('_tx_k');
         configure();
-        if (location) { clearTimeout(timer); timer = setTimeout(update, 500); }
+        if (location) { cancel(timer); timer = later(update, 500); }
     }
-    document.addEventListener('keydown', e => {
-        if (panel && e.composedPath().includes(panel.host)) return;
-        if (e.repeat || e.ctrlKey || e.altKey || e.metaKey || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName) || e.target?.isContentEditable) return;
-        if (e.key.toLowerCase() === 'i') { clearTimeout(timer); update(); }
-        if (e.key.toLowerCase() === 'r') resetSource();
-    }, true);
-    setInterval(() => {
-        if (document.hidden) return;
-        checkPage();
-        refreshMapMarker();
-    }, 1000);
-    setInterval(syncRound, 2000);
-    document.addEventListener('visibilitychange', async () => {
+    async function visibilityChanged() {
+        if (!enabled) return;
         if (document.hidden) {
-            clearTimeout(timer);
-            if (controller || (location && !view.address)) pendingLookup = !!location;
+            if (controller || translationAbort || (location && !view.address)) pendingLookup = !!location;
             job++;
-            controller?.abort();
-            controller = null;
-            syncController?.abort();
-            clearMapMarker();
+            controller?.abort(); controller = null;
+            translationAbort?.abort(); translationAbort = null;
+            syncController?.abort(); syncController = null; syncing = false;
+            recoveryController?.abort(); recoveryController = null;
+            cancelTimers();
+            stopMapWatch(); clearMapMarker();
         } else {
+            const generation = epoch;
             checkPage();
             await syncRound();
-            if (document.hidden) return;
-            if (pendingLookup && !controller) { clearTimeout(timer); update(); }
-            refreshMapMarker();
+            if (!enabled || epoch !== generation || document.hidden) return;
+            if (pendingLookup && !controller) { cancel(timer); guard(update); }
+            guard(startMapWatch); armFallback();
         }
-    });
+    }
+    function pause() {
+        if (!enabled) return;
+        enabled = false; epoch++;
+        storage.setItem('_tx_enabled', '0');
+        cancelTimers();
+        controller?.abort(); controller = null;
+        translationAbort?.abort(); translationAbort = null;
+        syncController?.abort(); syncController = null; syncing = false;
+        stopMapWatch(); clearMapMarker();
+        drain(pendingXHR); drain(cleanups);
+        requests = new WeakMap();
+        unmountPanel();
+        invalidate(); target = null;
+        updateLauncher();
+    }
+    function resume() {
+        if (enabled) return;
+        enabled = true; epoch++;
+        storage.setItem('_tx_enabled', '1');
+        checkPage();
+        guard(installHooks);
+        guard(() => listen(document, 'visibilitychange', visibilityChanged));
+        for (const event of ['popstate', 'hashchange']) guard(() => listen(window, event, checkPage));
+        guard(() => listen(document, 'keydown', e => {
+            if (panel && e.composedPath().includes(panel.host)) return;
+            if (e.repeat || e.ctrlKey || e.altKey || e.metaKey || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName) || e.target?.isContentEditable) return;
+            if (e.key.toLowerCase() === 'i') { cancel(timer); guard(update); }
+            if (e.key.toLowerCase() === 'r') resetSource();
+        }, true));
+        guard(startMapWatch); armFallback();
+        const generation = epoch;
+        guard(async () => {
+            await syncRound();
+            if (enabled && epoch === generation && !location) await recoverLocation();
+        });
+        if (!onDemand) guard(mountPanel);
+        updateLauncher();
+    }
     const ready = () => {
-        mountPanel();
-        // Quiet startup keeps existing settings and uses OSM if unconfigured.
-        // Dialogs are still available through the explicit settings action / R.
-        if (!quietMode) configure();
+        // Only the launcher and its shortcut survive pause, to allow recovery.
+        if (document.documentElement) guard(() => {
+            const host = document.createElement('div');
+            host.id = 'tuxun-helper-launcher';
+            host.style.cssText = 'position:fixed;top:96px;right:12px;z-index:2147483647;';
+            const root = host.attachShadow({ mode: 'open' });
+            root.innerHTML = '<style>button{font:12px/1.5 "Microsoft YaHei",sans-serif;background:#1c2635;color:#b8e7dc;border:1px solid #507f77;border-radius:20px;padding:7px 12px;cursor:pointer}button[hidden]{display:none}</style><button type="button"></button>';
+            launcher = root.querySelector('button');
+            launcher.addEventListener('click', e => { e.stopPropagation(); guard(togglePanel); });
+            document.documentElement.appendChild(host);
+        });
+        document.addEventListener('keydown', e => {
+            if (e.repeat || !e.altKey || !e.shiftKey || e.ctrlKey || e.metaKey || e.key.toLowerCase() !== 't') return;
+            if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName) || e.target?.isContentEditable) return;
+            e.preventDefault(); guard(togglePanel);
+        }, true);
+        if (enabled && !onDemand) guard(mountPanel);
+        updateLauncher();
+        if (enabled && !quietMode) guard(configure);
     };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready, { once: true });
-    else ready();
+    if (storage.getItem('_tx_enabled') !== '0') resume();
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => guard(ready), { once: true });
+    else guard(ready);
 })();
