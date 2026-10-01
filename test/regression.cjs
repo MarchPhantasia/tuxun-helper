@@ -9,9 +9,10 @@ const meta = '/api/v0/tuxun/mapProxy/getQQPanoInfo';
 const game = (round = 1) => ({success: true, data: {id: 'synthetic-game', currentRound: round, rounds: [{round, source: 'qq_pano', panoId: 'test-' + round}]}});
 const pano = (round = 1) => ({success: true, data: {pano: 'test-' + round, lat: 20 + round, lng: 100 + round}});
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
-function setup(customFetch) {
+function setup(customFetch, {quiet = false, hidden = false} = {}) {
   let now = 0, id = 0;
   const timers = new Map(), intervals = new Map(), logs = [], calls = [];
+  const listeners = new Map();
   class XHR {
     constructor() { this.events = new Map(); this.status = 200; this.responseType = 'json'; }
     open() {} send() {}
@@ -21,8 +22,8 @@ function setup(customFetch) {
   }
   const sandbox = {
     URL, URLSearchParams, AbortController, TextDecoder, XMLHttpRequest: XHR,
-    document: {readyState: 'complete', addEventListener() {}},
-    localStorage: {getItem: k => k === '_tx_s' || k === '_tx_translate' ? '0' : null},
+    document: {readyState: 'complete', hidden, addEventListener(k, fn) {listeners.set(k, fn);}},
+    localStorage: {getItem: k => k === '_tx_s' || k === '_tx_translate' || (k === '_tx_quiet' && !quiet) ? '0' : null},
     console: {log: s => logs.push(s), info() {}, warn() {}},
     setTimeout(fn, delay) { timers.set(++id, {fn, due: now + delay}); return id; },
     clearTimeout(key) { timers.delete(key); },
@@ -42,7 +43,8 @@ function setup(customFetch) {
     }
     now = to; await flush();
   }
-  return {start, tick, logs, calls, intervals};
+  return {start, tick, logs, calls, intervals, sandbox,
+    visibility: async hidden => {sandbox.document.hidden = hidden; await listeners.get('visibilitychange')(); await flush();}};
 }
 (async () => {
   for (const endpoint of endpoints) {
@@ -82,5 +84,38 @@ function setup(customFetch) {
     await e.intervals.get(2000)(); await e.tick(1500); assert.equal(e.logs.length, 2);
     console.log('PASS same-page round sync without duplicate lookups');
   }
-  console.log('All 6 regression scenarios passed.');
+  {
+    const e = setup(undefined, {quiet: true});
+    e.start(endpoints[0]).finish(game()); e.start(meta).finish(pano()); await e.tick(1000);
+    assert.equal(e.logs.length, 0); assert(e.calls.some(x => x.includes('/reverse?')));
+    console.log('PASS quiet default suppresses output while still retrieving address');
+  }
+  {
+    const e = setup((url, options, fallback) => url.includes('/solo/get') ? {ok: true, json: async () => game()} : fallback, {hidden: true});
+    e.start(endpoints[1]).finish(game()); e.start(meta).finish(pano()); await e.tick(1000);
+    await e.intervals.get(2000)(); assert.equal(e.calls.length, 0);
+    await e.visibility(false); await e.tick(2000);
+    assert.equal(e.calls.filter(x=>x.includes('/reverse?')).length, 1);
+    assert.equal(e.logs.length, 1);
+    console.log('PASS hidden tab defers address and sync; foreground resumes once');
+  }
+  {
+    const deferred = [], signals = [];
+    const e = setup((url, options, fallback) => {
+      if (url.includes('/reverse?')) {signals.push(options.signal); return new Promise(resolve => deferred.push(resolve));}
+      if (url.includes('/solo/get')) return {ok: true, json: async () => game()};
+      return fallback;
+    });
+    e.start(endpoints[1]).finish(game()); e.start(meta).finish(pano()); await e.tick(500);
+    await e.visibility(true); assert(signals[0].aborted);
+    deferred[0]({ok: true, json: async () => ({display_name: 'CANCELLED'})}); await flush(); assert.equal(e.logs.length, 0);
+    await e.visibility(false);
+    deferred[1]({ok: true, json: async () => ({display_name: 'RESUMED'})}); await flush();
+    assert.equal(e.logs.length, 1); assert(e.logs[0].includes('RESUMED'));
+    e.sandbox.window.location.href = origin + '/home';
+    await e.intervals.get(1000)();
+    const count = e.calls.length; await e.intervals.get(2000)(); assert.equal(e.calls.length, count);
+    console.log('PASS hidden tab aborts requests, ignores late results, and leaving game stops sync');
+  }
+  console.log('All 9 regression scenarios passed.');
 })().catch(e => {console.error(e); process.exitCode = 1;});

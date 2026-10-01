@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图寻辅助（题目匹配修复版）
 // @namespace    local.tuxun.round-fixed
-// @version      1.4.1
+// @version      1.5.0
 // @description  题目面板、中外文对照及华为底图辅助标点；支持挑战与排位模式
 // @match        *://tuxun.fun/*
 // @run-at       document-start
@@ -24,6 +24,12 @@
     let revision = 0, job = 0, timer, controller;
     let page = window.location.href;
     let gameInfoUrl = null, syncing = false;
+    let syncController = null, pendingLookup = false;
+    let quietMode = localStorage.getItem('_tx_quiet') !== '0';
+    function report(level, ...args) {
+        if (!quietMode) console[level](...args);
+        if (level === 'warn') show({ status: '数据读取异常，可刷新重试或关闭静默模式查看日志' });
+    }
     const translations = new Map();
     let mapMark = null;
     let pendingMapFocus = null;
@@ -78,6 +84,7 @@
         return null;
     }
     function refreshMapMarker() {
+        if (document.hidden) return;
         if (!mapEnabled) return;
         if (!target || !location) { clearMapMarker(); mapStatus('等待当前题目坐标'); return; }
         if (mapMark && (!mapMark.container.isConnected || mapMark.layer.isConnected === false ||
@@ -98,6 +105,7 @@
             const draw = () => {
                 try {
                     if (!location || !target) { pin.style.display = 'none'; return; }
+                    if (document.hidden) return;
                     if (!container.clientWidth || !container.clientHeight) {
                         pin.style.display = 'none';
                         mapStatus('地图已收起，展开后恢复标点');
@@ -171,6 +179,7 @@
         panel.root.getElementById('copy').disabled = !view.id;
         panel.root.getElementById('map-mark').checked = mapEnabled;
         panel.root.getElementById('map-focus').disabled = !location;
+        panel.root.getElementById('quiet').checked = quietMode;
         put('map-status', mapMessage);
     }
     function mountPanel() {
@@ -213,6 +222,7 @@
               <div class="toolbar"><label class="toggle" title="将地址和街景描述发送到 Google 翻译；不会发送账号或题目数据"><input type="checkbox" id="translate">自动中文翻译</label><div class="actions"><button id="refresh" title="重新查询当前题目（I）">刷新</button><button id="copy">复制</button></div></div>
               <div class="toolbar" style="margin-top:12px"><label class="toggle"><input type="checkbox" id="map-mark">地图辅助标点</label><button id="map-focus">定位标记</button></div>
               <div class="translation-note" id="map-status" role="status"></div>
+              <label class="toggle" title="收起面板、关闭本脚本的控制台输出；页面隐藏时暂停额外查询。不会隐藏脚本或规避网站检测。"><input type="checkbox" id="quiet">静默模式</label>
               <details><summary>坐标与街景 ID</summary><dl><dt>纬度，经度</dt><dd id="coords"></dd><dt>Pano ID</dt><dd id="pano"></dd></dl></details>
               <div class="foot"><span>题目起点 · 拖动标题栏移动</span><button class="link" id="settings">地图源设置</button></div>
             </div>
@@ -228,7 +238,7 @@
             collapse.setAttribute('aria-label', value ? '展开面板' : '折叠面板');
             localStorage.setItem('_tx_panel_fold', value ? '1' : '0');
         };
-        fold(localStorage.getItem('_tx_panel_fold') === '1');
+        fold(quietMode || localStorage.getItem('_tx_panel_fold') === '1');
         const place = (x, y) => {
             const rect = host.getBoundingClientRect();
             const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
@@ -259,6 +269,11 @@
         for (const event of ['pointerdown', 'pointerup', 'click', 'dblclick', 'wheel', 'keydown', 'keyup']) host.addEventListener(event, e => e.stopPropagation());
         root.getElementById('refresh').addEventListener('click', async () => { await syncRound(); clearTimeout(timer); update(); });
         root.getElementById('settings').addEventListener('click', resetSource);
+        root.getElementById('quiet').addEventListener('change', e => {
+            quietMode = e.target.checked;
+            localStorage.setItem('_tx_quiet', quietMode ? '1' : '0');
+            if (quietMode) fold(true);
+        });
         root.getElementById('map-mark').addEventListener('change', e => {
             mapEnabled = e.target.checked;
             localStorage.setItem('_tx_map_marker', mapEnabled ? '1' : '0');
@@ -281,6 +296,7 @@
     }
 
     function invalidate() {
+        pendingLookup = false;
         pendingMapFocus = null;
         revision++;
         job++;
@@ -299,6 +315,7 @@
             target = null;
             cache.clear();
             gameInfoUrl = null;
+            syncController?.abort();
             latestGameRequest = ++sequence;
         }
     }
@@ -334,13 +351,14 @@
         const url = gameInfoUrl, activePage = page, stamp = latestGameRequest;
         syncing = true;
         const abort = new AbortController();
+        syncController = abort;
         const timeout = setTimeout(() => abort.abort(), 8000);
         try {
             const response = await nativeFetch(url, { signal: abort.signal, credentials: 'same-origin', cache: 'no-store' });
             if (!response.ok) return;
             const data = await response.json();
             checkPage();
-            if (activePage !== page || url !== gameInfoUrl || stamp !== latestGameRequest) return;
+            if (abort.signal.aborted || document.hidden || activePage !== page || url !== gameInfoUrl || stamp !== latestGameRequest) return;
             const game = data?.success === true ? data.data : null;
             if (!game) return;
             const round = game.rounds?.find(r => r.round === game.currentRound);
@@ -348,10 +366,11 @@
                 target.id === String(round?.panoId) && target.source === round?.source) return;
             consume(begin(url), data);
         } catch (e) {
-            if (e.name !== 'AbortError') console.info('[图寻辅助] 题目同步失败，将重试。');
+            if (e.name !== 'AbortError') report('info', '[图寻辅助] 题目同步失败，将重试。');
         } finally {
             clearTimeout(timeout);
             syncing = false;
+            if (syncController === abort) syncController = null;
         }
     }
     function useCachedLocation() {
@@ -376,7 +395,7 @@
             const p = { qq_pano: 't', baidu_pano: 'b', google: 'g', google_pano: 'g' }[round.source];
             if (!p) {
                 show({ status: `暂未适配街景来源：${round.source}` });
-                console.info('[图寻辅助] 当前街景来源尚未验证，暂停查询：', round.source);
+                report('info', '[图寻辅助] 当前街景来源尚未验证，暂停查询：', round.source);
                 return;
             }
             target = { id: String(round.panoId), p, source: round.source, round: game.currentRound, game: game.id };
@@ -417,7 +436,7 @@
     XMLHttpRequest.prototype.send = function (...args) {
         const info = requests.get(this);
         let request;
-        try { request = info && begin(info.url); } catch (e) { console.warn('[图寻辅助] 请求识别失败', e); }
+        try { request = info && begin(info.url); } catch (e) { report('warn', '[图寻辅助] 请求识别失败', e); }
         if (request) {
             const onLoad = () => {
                 try {
@@ -425,7 +444,7 @@
                     const d = this.responseType === 'json' ? this.response :
                         (!this.responseType || this.responseType === 'text') ? JSON.parse(this.responseText) : null;
                     if (d) consume(request, d);
-                } catch (e) { console.warn('[图寻辅助] 元数据解析失败', e); }
+                } catch (e) { report('warn', '[图寻辅助] 元数据解析失败', e); }
             };
             this.addEventListener('load', onLoad, { once: true });
             this.addEventListener('loadend', () => this.removeEventListener('load', onLoad), { once: true });
@@ -435,11 +454,11 @@
     window.fetch = function (input, init) {
         let request;
         try { request = begin(typeof input === 'string' || input instanceof URL ? String(input) : input.url); }
-        catch (e) { console.warn('[图寻辅助] 请求识别失败', e); }
+        catch (e) { report('warn', '[图寻辅助] 请求识别失败', e); }
         const promise = nativeFetch(input, init);
         if (request) promise.then(response => {
             if (response.ok) response.clone().json().then(data => consume(request, data))
-                .catch(e => console.warn('[图寻辅助] 元数据解析失败', e));
+                .catch(e => report('warn', '[图寻辅助] 元数据解析失败', e));
         }, () => {});
         return promise;
     };
@@ -487,12 +506,14 @@
     }
     async function update() {
         checkPage();
+        if (document.hidden) { pendingLookup = !!(target && location); return; }
         if (!target || !location) {
             show({ status: '等待当前题目及匹配的街景数据' });
-            console.info('[图寻辅助] 等待当前题目及匹配的街景数据；必要时刷新页面。');
+            report('info', '[图寻辅助] 等待当前题目及匹配的街景数据；必要时刷新页面。');
             return;
         }
         controller?.abort();
+        pendingLookup = false;
         const abort = new AbortController();
         controller = abort;
         const token = ++job, version = revision, activePage = page;
@@ -515,7 +536,7 @@
             show({ status: a.status === 'fulfilled' ? '已匹配当前题目' : text, address: original, detail,
                 addressZh: a.status === 'rejected' ? '地址暂不可用，请稍后刷新' : '',
                 translation: autoTranslate() ? '正在自动翻译为简体中文…' : '自动翻译已关闭，原文仍会自动更新。' });
-            console.log(`[图寻辅助] 第 ${s.round} 题起点：${text}${detail ? '（' + detail + '）' : ''}\npano: ${s.id}\n坐标: ${s.lat}, ${s.lng}`);
+            report('log', `[图寻辅助] 第 ${s.round} 题起点：${text}${detail ? '（' + detail + '）' : ''}\npano: ${s.id}\n坐标: ${s.lat}, ${s.lng}`);
             if (!autoTranslate()) return;
             translationTimeout = setTimeout(() => abort.abort(), 8000);
             const translated = await Promise.allSettled([translate(original, abort.signal), translate(detail, abort.signal)]);
@@ -556,11 +577,35 @@
         if (e.key.toLowerCase() === 'i') { clearTimeout(timer); update(); }
         if (e.key.toLowerCase() === 'r') resetSource();
     }, true);
-    setInterval(checkPage, 250);
+    setInterval(() => {
+        if (document.hidden) return;
+        checkPage();
+        refreshMapMarker();
+    }, 1000);
     setInterval(syncRound, 2000);
-    setInterval(refreshMapMarker, 1000);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) syncRound(); });
-    const ready = () => { mountPanel(); configure(); };
+    document.addEventListener('visibilitychange', async () => {
+        if (document.hidden) {
+            clearTimeout(timer);
+            if (controller || (location && !view.address)) pendingLookup = !!location;
+            job++;
+            controller?.abort();
+            controller = null;
+            syncController?.abort();
+            clearMapMarker();
+        } else {
+            checkPage();
+            await syncRound();
+            if (document.hidden) return;
+            if (pendingLookup && !controller) { clearTimeout(timer); update(); }
+            refreshMapMarker();
+        }
+    });
+    const ready = () => {
+        mountPanel();
+        // Quiet startup keeps existing settings and uses OSM if unconfigured.
+        // Dialogs are still available through the explicit settings action / R.
+        if (!quietMode) configure();
+    };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready, { once: true });
     else ready();
 })();
