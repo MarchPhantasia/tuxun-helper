@@ -22,11 +22,11 @@
 ## 安装
 
 1. 在浏览器中安装 Tampermonkey。
-2. 打开仓库中的 [tuxun-helper.user.js](tuxun-helper.user.js)，选择 **Raw**；若未触发安装，复制完整代码到 Tampermonkey 的新建脚本中保存。
+2. 打开 [Greasy Fork 发布页](https://greasyfork.org/zh-CN/scripts/598289)，点击 **安装此脚本**，在 Tampermonkey 中确认安装。
 3. 禁用旧版及其他同名辅助脚本，确保只启用一个版本。
 4. 刷新图寻页面，点击右侧 **图寻** 小按钮或按 **Alt+Shift+T** 打开面板。静默模式保留已有地图源设置；没有设置时默认使用 OSM。点击“地图源设置”可选择高德并输入自己的 Web 服务 Key。
 
-本仓库未配置自动更新地址，更新时重新安装最新脚本即可。
+从 Greasy Fork 安装的版本由该平台提供安装与更新地址。此前从 GitHub 或本地文件安装的用户，可从上述发布页重新安装；确认只启用一个版本。GitHub 推送与 Greasy Fork 发布目前分别进行。
 
 ## 使用
 
